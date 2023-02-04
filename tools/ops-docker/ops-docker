@@ -1,0 +1,655 @@
+#!/bin/bash
+
+##
+# Configurable docker deployment tool in pure bash
+##
+
+# set -x
+set -e
+
+# Public
+
+## Base settings
+basename="project"
+networks=("bridge")
+images=()
+instances=1
+strategy="stop-start"
+remotes=()
+
+## Docker settings
+network_create_options=()
+network_connect_options=()
+build_options=()
+build_args=()
+create_options=()
+create_args=()
+start_options=()
+start_sleep=0
+
+## Globals
+OPS_PORT=()
+
+## Hooks
+pre_build() { :; }
+post_build() { :; }
+pre_create() { :; }
+post_create() { :; }
+pre_stop() { :; }
+post_stop() { :; }
+pre_start() { :; }
+post_start() { :; }
+
+# Private globals
+_script="$0"
+_workdir=".ops-docker"
+_scriptsdir="${_workdir}/scripts"
+_configsdir="${_workdir}/configs"
+_imagesdir="${_workdir}/images"
+_work_script=""
+_work_config=""
+_force_local=false
+_help=""
+_config=""
+_commands=()
+_networks=()
+_ports=()
+_containers=()
+_containers_created=()
+_containers_running=()
+_containers_exited=()
+_containers_next=()
+
+assemble() {
+  local cmd
+
+  echo "Assembling \`${images[0]}' image"
+
+  cmd=("docker build")
+
+  local image="";
+  for image in "${images[@]}"; do
+    cmd+=("-t ${image}")
+  done
+
+  cmd+=("${build_options[@]}")
+
+  if [[ -z "${build_args[@]}" ]]; then
+    cmd+=(".")
+  fi
+
+  cmd+=("${build_args[@]}")
+
+  _run_hook "pre_build" &&
+  eval "${cmd[@]}" &&
+  _run_hook "post_build" ||
+  return
+}
+
+transport() {
+  local image_id args user_host port path pid pids
+
+  echo "Transporting \`${images[0]}' image to remotes"
+
+  image_id="$(docker image inspect \
+    -f '{{.Id}}' "${images[0]}" | cut -d ':' -f 2)"
+
+  mkdir -p "${_scriptsdir}" "${_configsdir}"
+  mkdir -p "${_imagesdir}/${image_id}"
+
+  cp -u "${_script}" "${_scriptsdir}/${_work_script}"
+  cp -u "${_config}" "${_configsdir}/${_work_config}"
+
+  docker save "${image_id}" | tar \
+    --keep-newer-files \
+    --warning=no-ignore-newer \
+    -C "${_imagesdir}/${image_id}" \
+    -xf \
+    -
+
+  local uri="";
+  for uri in "${remotes[@]}"; do
+    args=($(_parse_uri "${uri}"))
+    user_host="${args[0]}"
+    port="${args[1]}"
+    path="${args[2]}"
+
+    (
+      rsync -avzRP -e "ssh -p ${port}" \
+        "${_imagesdir}/${image_id}" \
+        "${_scriptsdir}/${_work_script}" \
+        "${_configsdir}/${_work_config}" \
+        "${user_host}:${path}" && \
+      ssh \
+        -p "${port}" \
+        "${user_host}" \
+        "bash -lc ' \
+          tar -cC "${path}/${_imagesdir}/${image_id}" . | docker load && \
+          for tag in \"${images[@]}\"; do docker tag ${image_id} \${tag}; done \
+        '"
+    ) &
+
+    pids+=("$!")
+  done
+
+  wait ${pids[@]}
+
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || return
+  done
+}
+
+prepare() {
+  local cmd
+
+  echo "Preparing containers from \`${images[0]}' image for launch"
+
+  _define
+
+  local network="";
+  for network in "${networks[@]}"; do
+    if [[ ! "${_networks[@]}" = *"${network}"* ]]; then
+      docker network create \
+        ${network_create_options[@]} \
+        "${network}"
+    fi
+  done
+
+  docker rm -f ${_containers_next[@]} 2> /dev/null || true
+
+  # -p|--publish [IP:]port
+  local publish_re='(^|[^[:alnum:]])-[[:alnum:]]*p(ublish)?.*([[:space:]]|:)([0-9]+):'
+
+  local _create_options
+  local i=0 n=0;
+  for i in "${!_containers_next[@]}"; do
+    n=$((i+1))
+    _create_options=("${create_options[@]}")
+
+    cmd=(
+      "docker create"
+      "--restart unless-stopped"
+      "--name ${_containers_next[$i]}"
+      "--network ${networks[0]}"
+      "-e 'OPS_INSTANCE=$n'"
+    )
+
+    # Network-scoped alias is supported only in user defined networks
+    if [[ ! "${networks[@]}" =~ (^|[[:space:]])(bridge|host|none)([^[:alnum:]]|$) ]]; then
+      cmd+=("--net-alias ${basename}-$n")
+    fi
+
+    local j option port next_port bound_port
+    for j in "${!_create_options[@]}"; do
+      option="${_create_options[$j]}"
+
+      # Match and increment published port number
+      if [[ "${option}" =~ ${publish_re} ]]; then
+        port="${BASH_REMATCH[4]}"
+        next_port="$((${port}+$i))"
+
+        if [[ "${strategy}" = "start-stop" ]]; then
+          for bound_port in "${_ports[@]}"; do
+            if [[ "${next_port}" = "${bound_port}" ]]; then
+              next_port="$((${next_port}+1))"
+            fi
+          done
+        fi
+
+        _ports+=("${next_port}")
+        _create_options[$j]="${option/${port}:/${next_port}:}"
+
+        cmd+=("-e 'OPS_PORT=${next_port}'")
+      fi
+    done
+
+    cmd+=("${_create_options[@]}")
+    cmd+=("${images[0]}")
+    cmd+=("${create_args[@]}")
+
+    _run_hook "pre_create" &&
+    eval "${cmd[@]}" &&
+    _run_hook "post_create" ||
+    return
+
+    for network in "${networks[@]}"; do
+      docker network connect "${network}" "${_containers_next[$i]}"
+    done
+  done
+}
+
+launch() {
+  local containers
+
+  echo "Launching containers"
+
+  _define
+
+  containers=("${_containers_created[@]}")
+
+  if [[ -z "${containers[@]}" ]]; then
+    containers=("${_containers_running[@]}")
+  fi
+
+  if [[ -z "${containers[@]}" ]]; then
+    containers=("${_containers_exited[@]}")
+  fi
+
+  if [[ -z "${containers[@]}" ]]; then
+    echo "Nothing to launch, please \`prepare' something first"
+    return 1
+  fi
+
+  _stop_start() {
+    local cmd
+
+    local i=0;
+    while (( $i < ${instances} )); do
+      cmd=("docker start")
+      cmd+=("${start_options[@]}")
+      cmd+=("${containers[$i]}")
+
+      if [[ "${_containers_running[$i]}" ]]; then
+        echo "Stopping container"
+
+        _run_hook "pre_stop" &&
+        docker stop "${_containers_running[$i]}" &&
+        _run_hook "post_stop" ||
+        return
+      fi
+
+      echo "Starting container"
+
+      _run_hook "pre_start" &&
+      eval "${cmd[@]}" &&
+      sleep ${start_sleep} &&
+      _run_hook "post_start" ||
+      return
+
+      i=$((i+1))
+    done
+  }
+
+  _start_stop() {
+    local cmd
+
+    local i=0;
+    while (( $i < ${instances} )); do
+      cmd=("docker start")
+      cmd+=("${start_options[@]}")
+      cmd+=("${containers[$i]}")
+
+      echo "Starting container"
+
+      _run_hook "pre_start" &&
+      eval "${cmd[@]}" &&
+      sleep ${start_sleep} &&
+      _run_hook "post_start" ||
+      return
+
+      if [[ "${_containers_running[$i]}" ]]; then
+        echo "Stopping container"
+
+        _run_hook "pre_stop" &&
+        docker stop "${_containers_running[$i]}" &&
+        _run_hook "post_stop" ||
+        return
+      fi
+
+      i=$((i+1))
+    done
+  }
+
+  _stop_excess() {
+    local containers_excess=("${_containers_running[@]:${instances}}")
+
+    if [[ "${containers_excess[@]}" ]]; then
+      echo "Stopping excess containers"
+    fi
+
+    local name="";
+    for name in "${containers_excess[@]}"; do
+      docker stop "${name}"
+    done
+  }
+
+  if [[ "${strategy}" = "start-stop" ]]; then
+    _start_stop
+    _stop_excess
+  else
+    _stop_excess
+    _stop_start
+  fi
+}
+
+rollback() {
+  echo "Rolling back to previous containers"
+
+  _define
+
+  if [[ -z "${_containers_exited[@]}" ]]; then
+    echo "Nowhere to roll, no previous containers found"
+    return 1
+  fi
+
+  _stop_start() {
+    local cmd
+
+    local i=0;
+    for i in "${!_containers_running[@]}"; do
+      echo "Stopping container"
+
+      _run_hook "pre_stop" &&
+      docker stop "${_containers_running[$i]}" &&
+      _run_hook "post_stop" ||
+      return
+
+      if [[ "${_containers_exited[$i]}" ]]; then
+        cmd=("docker start")
+        cmd+=("${start_options[@]}")
+        cmd+=("${_containers_exited[$i]}")
+
+        echo "Starting container"
+
+        _run_hook "pre_start" &&
+        eval "${cmd[@]}" &&
+        sleep ${start_sleep} &&
+        _run_hook "post_start" ||
+        return
+      fi
+    done
+  }
+
+  _start_stop() {
+    local cmd
+
+    local i=0;
+    for i in "${!_containers_running[@]}"; do
+      if [[ "${_containers_exited[$i]}" ]]; then
+        cmd=("docker start")
+        cmd+=("${start_options[@]}")
+        cmd+=("${_containers_exited[$i]}")
+
+        echo "Starting container"
+
+        _run_hook "pre_start" &&
+        eval "${cmd[@]}" &&
+        sleep ${start_sleep} &&
+        _run_hook "post_start" ||
+        return
+      fi
+
+      echo "Stopping container"
+
+      _run_hook "pre_stop" &&
+      docker stop "${_containers_running[$i]}" &&
+      _run_hook "post_stop" ||
+      return
+    done
+  }
+
+  if [[ "${strategy}" = "start-stop" ]]; then
+    _start_stop
+  else
+    _stop_start
+  fi
+}
+
+_run_hook() {
+  _reset_vars
+  $1
+}
+
+_reset_vars() {
+  OPS_PORT=($(_parse_ports))
+}
+
+_parse_ports() {
+  local ports=($(docker ps -f name="${basename}" --format="{{.Names}}" | \
+    xargs -r -n 1 docker inspect \
+      --format='{{.State.StartedAt}}{{range .NetworkSettings.Ports}} {{(index . 0).HostPort}}{{end}}' 2> /dev/null | \
+    sort -r -k 1 | \
+    cut -d ' ' -f 2- | xargs -L 1 bash -c "printf '%s\n' \$@ | tac" -))
+
+  echo "${ports[@]}"
+}
+
+_define() {
+  local containers_all=($(docker ps \
+    -a \
+    -f name="${basename}" \
+    --format '{{.Names}}'))
+
+  local containers_running_all=($(docker ps \
+    -a \
+    -f name="${basename}" \
+    -f status=running \
+    --format '{{.Names}}'))
+
+  local containers_created_all=($(docker ps \
+    -a \
+    -f name="${basename}" \
+    -f status=created \
+    --format '{{.Names}}'))
+
+  local containers_exited_all=($(docker ps \
+    -a \
+    -f name="${basename}" \
+    -f status=exited \
+    --format '{{.Names}}'))
+
+  _networks=($(docker network ls --format '{{.Name}}'))
+
+  _ports=($(_parse_ports))
+  _ports=($(printf '%s\n' "${_ports[@]}" | sort -n))
+
+  _containers=()
+  local name="";
+  for name in "${containers_all[@]}"; do
+    if [[ "${name}" =~ ^${basename}-[0-9]+$ ]]; then
+      _containers+=("${name}")
+    fi
+  done
+
+  _containers_running=()
+  local name="";
+  for name in "${containers_running_all[@]}"; do
+    if [[ "${name}" =~ ^${basename}-[0-9]+$ ]]; then
+      _containers_running+=("${name}")
+    fi
+  done
+
+  _containers_created=()
+  local name="";
+  for name in "${containers_created_all[@]}"; do
+    if [[ "${name}" =~ ^${basename}-[0-9]+$ ]]; then
+      _containers_created+=("${name}")
+    fi
+  done
+
+  _containers_exited=()
+  local name="";
+  for name in "${containers_exited_all[@]}"; do
+    if [[ "${name}" =~ ^${basename}-[0-9]+$ ]]; then
+      _containers_exited+=("${name}")
+    fi
+  done
+
+  _containers_next=()
+  local i=1;
+  while (( ${#_containers_next[@]} < ${instances} )); do
+    if [[ "${_containers[@]}" != *"${basename}-$i"* ]]; then
+      _containers_next+=("${basename}-$i")
+    fi
+    i=$((i+1))
+  done
+}
+
+_parse_uri() {
+  local uri="${1/ssh:\/\//}"
+  local user_host="${uri%%/*}"
+  local port="${user_host#*:}"
+  local path="/${uri#*/}"
+  local user_host="${user_host/:${port}}"
+
+  if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
+    port="22"
+  fi
+
+  echo "${user_host}" "${port}" "${path}"
+}
+
+_exec() {
+  local cmd="";
+  for cmd in "${_commands[@]}"; do
+    _commands=("${_commands[@]:1}")
+
+    ${cmd} || return
+
+    if [[ "${cmd}" == "_exec_remote" ]]; then
+      break
+    fi
+  done
+}
+
+_exec_remote() {
+  local cmd args pid pids
+
+  local uri="";
+  for uri in "${remotes[@]}"; do
+    args=($(_parse_uri "${uri}"))
+    user_host="${args[0]}"
+    port="${args[1]}"
+    path="${args[2]}"
+
+    cmd=("ssh")
+
+    # Match -t option for interactive session
+    if [[ "${create_options[@]}" =~ (^|[:space:])-[[:alnum:]]*t ]]; then
+      cmd+=("-t")
+    fi
+
+    cmd+=("-p ${port}")
+    cmd+=("${user_host}")
+    cmd+=("bash -l ${path}/${_scriptsdir}/${_work_script}")
+    cmd+=("-c ${path}/${_configsdir}/${_work_config}")
+    cmd+=("-l")
+    cmd+=("${_commands[@]}")
+
+    eval "${cmd[@]}" &
+
+    pids+=("$!")
+  done
+
+  wait ${pids[@]}
+
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || return
+  done
+}
+
+_print_help() {
+  echo "\
+Configurable docker deployment tool in pure bash
+
+Usage: $0 [options] <commands>
+
+Commands:
+  assemble   Assemble image locally
+  transport  Transport image to remotes
+  prepare    Prepare containers for launch
+  launch     Launch ready containers
+  deploy     Shortcut for: prepare launch
+  rollout    Shortcut for: assemble transport -l; prepare launch
+  rollback   Stop current and start previous containers
+
+Options:
+  -c, --config  Configuration file
+  -l, --local   Force local deployment
+  -h, --help    Print help and exit\
+  "
+}
+
+_parse_args() {
+  local args
+
+  until [[ -z "$@" ]]; do
+    case "$@" in
+      -c*|--config*)
+        if [[ "$2" ]]; then
+          _config="$2"
+          shift
+        fi
+        shift
+        ;;
+
+      -l*|--local*)
+        _force_local=true
+        shift
+        ;;
+
+      -h*|--help*)
+        _help=true
+        shift
+        ;;
+
+      [!-]*)
+        args+=("$1")
+        shift
+        ;;
+
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  local arg="";
+  for arg in "${args[@]}"; do
+    if [[ "assemble transport prepare launch rollback" = *"${arg}"* ]]; then
+      _commands+=("${arg}")
+    fi
+
+    if [[ "${arg}" = "deploy" ]]; then
+      _commands+=("prepare" "launch")
+    fi
+
+    if [[ "${arg}" = "rollout" ]]; then
+      _force_local=true
+      _commands+=("assemble" "transport" "_exec_remote" "prepare" "launch")
+    fi
+  done
+}
+
+main() {
+  _parse_args "$@"
+
+  if [[ "${_help}" = true || -z "${_commands[@]}" ]]; then
+    _print_help
+    return 1
+  fi
+
+  if [[ ! "${_config}" || ! -f "${_config}" ]]; then
+    echo "Configuration file was not found: -c ${_config}"
+    return 1
+  fi
+
+  source "${_config}"
+
+  if [[ -z "${images}" ]]; then
+    images=("${basename}")
+  fi
+
+  _work_script="$(openssl sha256 "${_script}" | cut -d ' ' -f 2)"
+  _work_config="$(openssl sha256 "${_config}" | cut -d ' ' -f 2)"
+
+  if [[ "${remotes[@]}" && ! "${_force_local}" = true ]]; then
+    _exec_remote
+  else
+    _exec
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]}" = "${0}" ]]; then
+  main "$@"
+fi

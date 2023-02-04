@@ -1,0 +1,9 @@
+{
+  "name": "vf-db",
+  "version": "1.0.0",
+  "description": "Video funnel DB",
+  "main": "index.js",
+  "scripts": {
+    "start": "scripts/start"
+  }
+}
