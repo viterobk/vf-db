@@ -3,4 +3,4 @@
 PATH="tools/ops-docker:${PATH}"
 target="${1:-dev}"
 
-ops-docker -c "docker/${target}.cfg" -l assemble deploy
+ops-docker -c "docker/${target}.cfg" -l assemble

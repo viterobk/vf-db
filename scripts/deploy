@@ -1,0 +1,6 @@
+#!/bin/sh
+
+PATH="tools/ops-docker:${PATH}"
+target="${1:-prod}"
+
+ops-docker -c "docker/${target}.cfg" rollout

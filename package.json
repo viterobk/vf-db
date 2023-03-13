@@ -4,6 +4,10 @@
   "description": "Video funnel DB",
   "main": "index.js",
   "scripts": {
-    "start": "scripts/start"
+    "dev": "scripts/start dev",
+    "prod": "scripts/start prod",
+    "deploy": "scripts/deploy",
+    "build:dev": "scripts/build dev",
+    "build:prod": "scripts/build prod"
   }
 }

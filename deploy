@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+
+container=vf-db-prod
+server=root@91.105.198.209
+main_container=$container-1
+bak_container=$container-bak
+
+# Run deploy container
+docker run -dit -v /var/run/docker.sock:/var/run/docker.sock --name deploy docker:23.0.1-cli
+docker exec deploy apk update
+docker exec deploy apk add bash nodejs npm openssl git rsync tar
+docker exec deploy mkdir /root/.ssh
+docker cp ~/.ssh/id_rsa deploy:/root/.ssh
+docker cp ~/.ssh/id_rsa.pub deploy:/root/.ssh
+docker cp ~/.ssh/known_hosts deploy:/root/.ssh
+docker cp . deploy:/var/repo
+
+if [ $( ssh $server docker ps -a | grep $bak_container | wc -l ) -gt 0 ]; then
+  echo "-bak container exists"
+  ssh $server docker stop $bak_container
+  ssh $server docker rm -f $bak_container
+fi
+
+if [ $( ssh $server docker ps -a | grep $main_container | wc -l ) -gt 0 ]; then
+  ssh $server docker stop $main_container
+  ssh $server docker rename $main_container $bak_container
+
+  docker exec -w /var/repo deploy npm run deploy || \
+    ssh $server docker rename $bak_container $main_container && \
+    ssh $server docker start $main_container
+
+  ssh $server docker rm -f $bak_container
+else
+  docker exec -w /var/repo deploy npm run deploy
+fi
+
+docker stop deploy && docker rm deploy
